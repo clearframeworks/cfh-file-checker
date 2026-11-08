@@ -1,0 +1,2 @@
+# The legacy README upgrade fixture is byte-specific on Windows.
+README.txt text eol=crlf

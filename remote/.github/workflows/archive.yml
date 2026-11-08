@@ -1,0 +1,82 @@
+name: Remote ZIP workspace
+run-name: Archive ${{ inputs.request_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: inspect, remove, or extract
+        required: true
+      url:
+        description: Public HTTPS ZIP URL (visible in workflow history)
+        required: true
+      entry:
+        description: Exact file entry to remove or copy (visible in workflow history)
+        required: false
+      request_id:
+        description: Unique request identifier
+        required: true
+permissions:
+  contents: read
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Check archive safety rules
+        run: python3 scripts/test_archive.py
+      - name: Download public archive
+        env:
+          TARGET_URL: ${{ inputs.url }}
+        run: python3 scripts/download.py
+      - name: Scan archive
+        run: |
+          if [ "$(stat -c %s sample)" -gt 10485760 ]; then echo 'RESULT: ZIP exceeds 10 MiB'; exit 1; fi
+          mkdir definitions
+          chmod 777 definitions
+          docker pull clamav/clamav:stable
+          docker run --rm --entrypoint freshclam -v "$PWD/definitions:/var/lib/clamav" clamav/clamav:stable
+          set +e
+          docker run --rm --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=128m --cap-drop ALL --security-opt no-new-privileges --memory 2g --cpus 2 --entrypoint clamscan -v "$PWD/definitions:/var/lib/clamav:ro" -v "$PWD/sample:/sample:ro" clamav/clamav:stable --infected --alert-exceeds-max=yes --alert-encrypted=yes --max-files=1000 --max-filesize=25M --max-scansize=100M /sample > scan.log 2>&1
+          result=$?
+          if [ "$result" -eq 1 ]; then echo 'RESULT: Archive stopped: threat or scanner limit detected'; exit 1; fi
+          if [ "$result" -ne 0 ] || ! grep -Eq '^Scanned files: +[1-9][0-9]*$' scan.log; then echo 'RESULT: Archive stopped: scan failed or coverage was incomplete'; exit 1; fi
+          echo 'Scan completed; no known threat detected. This does not establish safety.'
+      - name: Process archive as data
+        env:
+          OPERATION: ${{ inputs.operation }}
+          ENTRY: ${{ inputs.entry }}
+        run: python3 scripts/archive.py
+      - name: Retain inventory and edited ZIP for one day
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: cfh-archive-${{ inputs.request_id }}
+          path: archive-output/
+          if-no-files-found: error
+          retention-days: 1
+      - name: Verify retained artifact round trip
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: cfh-archive-${{ inputs.request_id }}
+          path: verify-output
+      - name: Compare artifact bytes
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          from pathlib import Path
+          a, b = Path('archive-output'), Path('verify-output')
+          expected = sorted(p.name for p in a.iterdir())
+          actual = sorted(p.name for p in b.iterdir())
+          if expected != actual or not expected:
+              raise SystemExit('Artifact file list mismatch')
+          for name in expected:
+              with (a / name).open('rb') as left, (b / name).open('rb') as right:
+                  if hashlib.file_digest(left, 'sha256').digest() != hashlib.file_digest(right, 'sha256').digest():
+                      raise SystemExit('Artifact bytes mismatch')
+          print('Artifact round trip verified.')
+          PY
+      - name: Report completion
+        run: |
+          echo 'RESULT: Archive completed; open this run to retrieve the one-day artifact'

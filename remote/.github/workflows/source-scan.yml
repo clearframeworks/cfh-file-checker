@@ -1,0 +1,59 @@
+name: Review GitHub source
+run-name: Source ${{ inputs.request_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: Public GitHub owner/repository
+        required: true
+      revision:
+        description: Exact full commit SHA
+        required: true
+      request_id:
+        description: Unique request identifier
+        required: true
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Check source report outcomes
+        run: python3 scripts/test_source_report.py
+      - name: Fetch exact public source archive
+        env:
+          SOURCE_REPOSITORY: ${{ inputs.repository }}
+          SOURCE_REVISION: ${{ inputs.revision }}
+        run: python3 scripts/source_download.py
+      - name: Validate archive and stage lockfiles as data
+        run: |
+          mkdir locks
+          chmod 777 locks
+          docker pull python:3.12.12-slim@sha256:f3fa41d74a768c2fce8016b98c191ae8c1bacd8f1152870a3f9f87d350920b7c
+          timeout 90s docker run --rm --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=128m --cap-drop ALL --security-opt no-new-privileges --pids-limit 128 --memory 512m --cpus 2 -v "$PWD/scripts:/scripts:ro" python:3.12.12-slim@sha256:f3fa41d74a768c2fce8016b98c191ae8c1bacd8f1152870a3f9f87d350920b7c python /scripts/test_source_prepare.py
+          timeout 90s docker run --rm --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=128m --cap-drop ALL --security-opt no-new-privileges --pids-limit 128 --memory 512m --cpus 2 -v "$PWD/sample:/input/sample:ro" -v "$PWD/scripts:/scripts:ro" -v "$PWD/locks:/out" python:3.12.12-slim@sha256:f3fa41d74a768c2fce8016b98c191ae8c1bacd8f1152870a3f9f87d350920b7c python /scripts/source_prepare.py
+      - name: Check archive for known malware
+        run: |
+          mkdir definitions
+          chmod 777 definitions
+          docker pull clamav/clamav:stable
+          docker run --rm --entrypoint freshclam -v "$PWD/definitions:/var/lib/clamav" clamav/clamav:stable
+          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --entrypoint clamscan -v "$PWD/definitions:/var/lib/clamav:ro" clamav/clamav:stable --version
+          set +e
+          timeout 240s docker run --rm --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=128m --cap-drop ALL --security-opt no-new-privileges --pids-limit 128 --memory 2g --cpus 2 --entrypoint clamscan -v "$PWD/definitions:/var/lib/clamav:ro" -v "$PWD/sample:/sample:ro" clamav/clamav:stable --infected --alert-exceeds-max=yes --alert-encrypted=yes --max-files=1100 --max-filesize=25M --max-scansize=100M /sample > clam.log 2>&1
+          result=$?
+          if [ "$result" -eq 1 ]; then echo 'RESULT: A known threat or scanner limit was detected; dependency scan not completed'; exit 1; fi
+          if [ "$result" -ne 0 ] || ! grep -Eq '^Scanned files: +[1-9][0-9]*$' clam.log; then echo 'RESULT: Malware scan failed; coverage unknown'; exit 1; fi
+          echo 'Malware scanner completed; detection coverage is limited.'
+      - name: Audit staged lockfiles
+        run: |
+          if ! docker pull ghcr.io/google/osv-scanner@sha256:4f3b7e2c64b9d38a5febc5a7e4a3dfef1d1362f726dea7a2ef4762b46469fcd0; then echo 'RESULT: Dependency scanner unavailable; coverage unknown'; exit 1; fi
+          docker run --rm --network none ghcr.io/google/osv-scanner@sha256:4f3b7e2c64b9d38a5febc5a7e4a3dfef1d1362f726dea7a2ef4762b46469fcd0 --version || true
+          set +e
+          timeout 240s docker run --rm --read-only --tmpfs /tmp:rw,noexec,nosuid,size=128m --cap-drop ALL --security-opt no-new-privileges --pids-limit 128 --memory 1g --cpus 2 --user 65534:65534 -e HOME=/tmp -v "$PWD/locks:/work:ro" ghcr.io/google/osv-scanner@sha256:4f3b7e2c64b9d38a5febc5a7e4a3dfef1d1362f726dea7a2ef4762b46469fcd0 scan source --no-call-analysis=all --verbosity=warn --format=json --all-packages --recursive /work > osv.json 2> osv.err
+          result=$?
+          OSV_EXIT="$result" python3 scripts/source_report.py

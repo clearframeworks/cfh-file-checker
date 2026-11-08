@@ -1,0 +1,48 @@
+name: Check a file
+run-name: Check ${{ inputs.request_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: Public HTTPS download URL (visible to repository collaborators)
+        required: true
+      request_id:
+        description: Unique request identifier
+        required: true
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Download public file
+        env:
+          TARGET_URL: ${{ inputs.url }}
+        run: python3 scripts/download.py
+      - name: Record file hash
+        run: sha256sum sample
+      - name: Prepare scanner
+        run: |
+          mkdir definitions
+          chmod 777 definitions
+          docker pull clamav/clamav:stable
+          docker run --rm --entrypoint freshclam -v "$PWD/definitions:/var/lib/clamav" clamav/clamav:stable
+      - name: Scan without network access
+        run: |
+          set +e
+          docker run --rm --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=128m --cap-drop ALL --security-opt no-new-privileges --memory 2g --cpus 2 --entrypoint clamscan -v "$PWD/definitions:/var/lib/clamav:ro" -v "$PWD/sample:/sample:ro" clamav/clamav:stable --infected /sample > scan.log 2>&1
+          result=$?
+          cat scan.log
+          if [ "$result" -eq 0 ] && grep -Eq '^Scanned files: +1$' scan.log; then
+            echo 'RESULT: No known threat detected (not a safety guarantee)'
+          elif [ "$result" -eq 1 ] && grep -Eq '^/sample: .+ FOUND$' scan.log; then
+            echo 'RESULT: Threat detected'
+          else
+            echo 'RESULT: Scanner failed; result unknown'
+            exit 2
+          fi
+          exit "$result"

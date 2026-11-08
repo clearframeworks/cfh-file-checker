@@ -1,0 +1,63 @@
+name: Remote text workspace
+run-name: Workspace ${{ inputs.request_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: import, replace, append, or delete
+        required: true
+      filename:
+        description: Plain filename within the workspace
+        required: true
+      url:
+        description: Public HTTPS URL for import
+        required: false
+      find:
+        description: Literal text to replace (visible in workflow history)
+        required: false
+      replacement:
+        description: Text to replace with or append (visible in workflow history)
+        required: false
+      request_id:
+        description: Unique request identifier
+        required: true
+permissions:
+  contents: write
+jobs:
+  workspace:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: cfh-text-workspace
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Download public file
+        if: inputs.operation == 'import'
+        env:
+          TARGET_URL: ${{ inputs.url }}
+        run: python3 scripts/download.py
+      - name: Scan imported file
+        if: inputs.operation == 'import'
+        run: |
+          mkdir definitions
+          chmod 777 definitions
+          docker pull clamav/clamav:stable
+          docker run --rm --entrypoint freshclam -v "$PWD/definitions:/var/lib/clamav" clamav/clamav:stable
+          set +e
+          docker run --rm --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=128m --cap-drop ALL --security-opt no-new-privileges --memory 2g --cpus 2 --entrypoint clamscan -v "$PWD/definitions:/var/lib/clamav:ro" -v "$PWD/sample:/sample:ro" clamav/clamav:stable --infected /sample > scan.log 2>&1
+          result=$?
+          cat scan.log
+          if [ "$result" -eq 1 ]; then echo 'RESULT: Import stopped: a known threat was detected'; exit 1; fi
+          if [ "$result" -ne 0 ] || ! grep -Eq '^Scanned files: +1$' scan.log; then echo 'RESULT: Import stopped: scan failed or coverage was incomplete'; exit 1; fi
+      - name: Apply workspace operation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OPERATION: ${{ inputs.operation }}
+          FILENAME: ${{ inputs.filename }}
+          FIND: ${{ inputs.find }}
+          REPLACEMENT: ${{ inputs.replacement }}
+          REPOSITORY: ${{ github.repository }}
+        run: python3 scripts/workspace.py
